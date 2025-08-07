@@ -20,23 +20,19 @@ from langchain.schema import Document, BaseRetriever
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain.retrievers import BM25Retriever, EnsembleRetriever
-from langchain.retrievers.document_compressors import DocumentCompressorPipeline
-from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+# NOTE: Reranker imports have been removed
 
 # LLM and Embeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
 
 # --- Configuration ---
-# This class now securely loads your keys from the .env file.
 class Settings(BaseSettings):
     gemini_api_key: str
     groq_api_key: str
     auth_token: str
     embedding_model: str = "models/text-embedding-004"
     llm_model: str = "llama3-70b-8192"
-    reranker_model_name: str = "BAAI/bge-reranker-v2-m3"
 
     class Config:
         env_file = ".env"
@@ -47,7 +43,6 @@ settings = Settings()
 # --- Global State and Cache ---
 class AppState:
     llm: ChatGroq = None
-    reranker: HuggingFaceCrossEncoder = None
     retriever_cache: Dict[str, BaseRetriever] = {}
 
 app_state = AppState()
@@ -55,7 +50,7 @@ app_state = AppState()
 # --- FastAPI Lifespan Events for Pre-loading ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load the LLM and Reranker model on startup
+    # Load the LLM on startup
     print("Application starting up...")
     app_state.llm = ChatGroq(
         groq_api_key=settings.groq_api_key,
@@ -63,9 +58,7 @@ async def lifespan(app: FastAPI):
         temperature=0.1,
         max_tokens=1024
     )
-    print("Loading local reranker model... (This may take a moment on first run)")
-    app_state.reranker = HuggingFaceCrossEncoder(model_name=settings.reranker_model_name)
-    print("Models loaded successfully.")
+    print("LLM loaded successfully.")
     yield
     # Clean up resources on shutdown (optional)
     print("Application shutting down...")
@@ -73,9 +66,9 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI App Instance ---
 app = FastAPI(
-    title="HackRX 6.0 - High-Performance RAG Solution",
-    description="A highly optimized RAG pipeline with pre-loaded models and caching to meet <30s latency.",
-    version="5.0.0",
+    title="HackRX 6.0 - Optimized RAG Solution",
+    description="A highly optimized and fast RAG pipeline using Groq and Hybrid Search.",
+    version="6.0.0",
     lifespan=lifespan
 )
 
@@ -101,16 +94,11 @@ class AnswersResponse(BaseModel):
 # --- Core RAG Logic ---
 
 def clean_pdf_text(text: str) -> str:
-    """Cleans up common text extraction artifacts from PDFs."""
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'[^a-zA-Z0-9\s.,;?()-:%$€£@\'"]', '', text)
     return text.strip()
 
 async def get_or_create_retriever(document_url: str) -> BaseRetriever:
-    """
-    Retrieves a pre-built retriever from the cache or creates a new one
-    if the document URL has not been processed before.
-    """
     if document_url in app_state.retriever_cache:
         print(f"Retriever found in cache for: {document_url}")
         return app_state.retriever_cache[document_url]
@@ -145,25 +133,19 @@ async def get_or_create_retriever(document_url: str) -> BaseRetriever:
             task_type="retrieval_document"
         )
 
-        # Increase K to cast a wider net for the reranker
         faiss_vectorstore = FAISS.from_documents(chunks, embeddings)
-        faiss_retriever = faiss_vectorstore.as_retriever(search_kwargs={"k": 15})
+        faiss_retriever = faiss_vectorstore.as_retriever(search_kwargs={"k": 7})
+        
         bm25_retriever = BM25Retriever.from_documents(chunks)
-        bm25_retriever.k = 15
+        bm25_retriever.k = 7
         
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, faiss_retriever], weights=[0.5, 0.5]
         )
         
-        compressor = DocumentCompressorPipeline(transformers=[app_state.reranker])
-        
-        compression_retriever = ContextualCompressionRetriever(
-            base_compressor=compressor, base_retriever=ensemble_retriever
-        )
-        
-        app_state.retriever_cache[document_url] = compression_retriever
+        app_state.retriever_cache[document_url] = ensemble_retriever
         print("Retriever created and cached successfully.")
-        return compression_retriever
+        return ensemble_retriever
     except Exception as e:
         print(f"ERROR during retriever initialization: {e}")
         traceback.print_exc()
@@ -173,7 +155,6 @@ async def get_or_create_retriever(document_url: str) -> BaseRetriever:
         )
 
 async def generate_answer(question: str, retriever: BaseRetriever, semaphore: asyncio.Semaphore) -> str:
-    """Generates a single answer string for a given question."""
     async with semaphore:
         try:
             print(f"\nProcessing question: {question}")
@@ -208,13 +189,8 @@ async def generate_answer(question: str, retriever: BaseRetriever, semaphore: as
             print(f"Error processing question '{question}': {str(e)}")
             return f"Error processing question: {str(e)}"
 
-# --- API Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=AnswersResponse, dependencies=[Depends(verify_token)])
 async def run_rag_pipeline(data: DocumentInput):
-    """
-    Main API endpoint to run the RAG pipeline.
-    It initializes the system with the provided document URL and answers all questions.
-    """
     try:
         retriever = await get_or_create_retriever(str(data.documents))
         semaphore = asyncio.Semaphore(10)
@@ -232,13 +208,10 @@ async def run_rag_pipeline(data: DocumentInput):
             detail=f"An unexpected error occurred: {str(e)}"
         )
 
-# --- Root Endpoint for Health Check ---
 @app.get("/", summary="Health Check")
 async def root():
     return {"status": "ok", "title": app.title, "version": app.version}
 
 if __name__ == "__main__":
     import uvicorn
-    
-    port = int(os.environ.get("PORT", 8000))  # Use Render's PORT env variable
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
