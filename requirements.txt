@@ -23,5 +23,5 @@ pypdf==4.2.0
 faiss-cpu==1.8.0
 rank_bm25==0.2.2
 
-
+sentence-transformers==2.7.0
 numpy==1.26.4
